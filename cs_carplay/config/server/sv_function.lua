@@ -1,0 +1,34 @@
+-- ============================================================
+--  cs_carplay  |  config/server/sv_function.lua
+--  Server-side helper exports / overrides.
+--  Customise these to match your server's setup.
+-- ============================================================
+
+-- ── Example: hook into ESX job-change to close UI ─────────
+-- if CodeStudio.ServerType == 'ESX' then
+--     AddEventHandler('esx:setJob', function(xPlayer, job, lastJob)
+--         -- additional logic here if needed
+--     end)
+-- end
+
+-- ── Garage / vehicle ownership table note ─────────────────
+--  The table name used for ownership checks is set in config:
+--    CodeStudio.Main.RadioInstall.Options.Vehicles_Table
+--
+--  Default: 'player_vehicles'  (standard ESX table)
+--  QB-Core: 'player_vehicles'  (same schema, owner = citizenid)
+--
+--  The server expects:   plate  VARCHAR(20)
+--                        owner  VARCHAR(100)   (identifier)
+--
+--  If your schema differs, adjust the query in server.lua's
+--  cs:carplay:addInstall handler accordingly.
+
+-- ── Custom notification override (server-side) ────────────
+--  Uncomment and adapt to use your preferred notify system.
+--
+-- RegisterNetEvent('cs:carPlay:notification', function(msg, state)
+--     local src = source
+--     -- TriggerClientEvent('esx:showNotification', src, msg)
+--     -- TriggerClientEvent('QBCore:Notify', src, msg, state)
+-- end)
