@@ -1,38 +1,45 @@
 -- ============================================================
 --  cs_carplay  |  main/client.lua
---  Full client-side logic: UI management, NUI callbacks,
---  xSound integration, autopilot, parking sensor, cameras.
+--  Full client-side logic matching the deobfuscated UI contracts.
+--
+--  Data contract (openUI message to UI):
+--    {curVeh, songData:{musicPlaying,musicURL,...},
+--     vData:{curLoc,locDist,curTime,weatherType},
+--     loginData:{login,username} | nil}
+--
+--  NUI callbacks implemented here (matching ui/main.js):
+--    /fetchAppInfo  /loginAccount  /logoutAccount
+--    /fetchPlaylist /saveMusic     /likeData
+--    /musicPlay     /clearPlaylist /stopMusic
+--    /adjustVolume  /loopMusic     /carInfo
+--    /carAction     /carControl    /carCamera
+--    /autoPilot     /chatGPTAction /installRadio
+--    /closeUI       /openMap
 -- ============================================================
 
--- ── State ──────────────────────────────────────────────────
-local isUIOpen       = false
-local currentVehicle = nil
-local musicPlaying   = false
-local musicLoop      = false
-local musicVolume    = CodeStudio.Default_Music_Volume
+-- ── State ────────────────────────────────────────────────────
+local isUIOpen        = false
+local currentVehicle  = 0
+local curVehNetId     = 0
+local musicPlaying    = false
+local musicLoop       = false
+local musicVolume     = CodeStudio.Default_Music_Volume
 local autoPilotActive = false
 local autoPilotBlip   = nil
-local autoPilotThread = nil
-local parkingThread   = nil
-local cameraActive    = false
-local frontCam        = nil
-local backCam         = nil
 local hazardActive    = false
 local hazardThread    = nil
-local rgbThread       = nil
 local rgbActive       = false
-local currentMusicData = {}
-local neonColors      = {}
-local neonIndex       = 0
+local rgbThread       = nil
+local parkThread      = nil
+local frontCam        = nil
+local backCam         = nil
+local currentSong     = {}
 
--- ── Helpers ────────────────────────────────────────────────
+-- ── Helpers ──────────────────────────────────────────────────
 
-local function GetPlayerVehicle()
+local function GetVeh()
     local ped = PlayerPedId()
-    if IsPedInAnyVehicle(ped, false) then
-        return GetVehiclePedIsIn(ped, false)
-    end
-    return nil
+    return IsPedInAnyVehicle(ped, false) and GetVehiclePedIsIn(ped, false) or 0
 end
 
 local function IsDriver()
@@ -41,55 +48,70 @@ local function IsDriver()
     return veh ~= 0 and GetPedInVehicleSeat(veh, -1) == ped
 end
 
-local function GetVehiclePlate(veh)
-    return string.gsub(GetVehicleNumberPlateText(veh), '%s+', '')
+local function GetPlate(veh)
+    return string.upper(string.gsub(GetVehicleNumberPlateText(veh), '%s+', ''))
 end
 
-local function SendUI(action, data)
+local function NUI(action, data)
     SendNUIMessage({ action = action, data = data })
 end
 
--- ── Parking Sensor ─────────────────────────────────────────
+-- ── Waypoint distance ─────────────────────────────────────────
+local function GetWaypointDistance(pos)
+    if not IsWaypointActive() then return '0.0 ' .. CodeStudio.MarkedLocation_Unit end
+    local wp  = GetBlipCoords(GetFirstBlipInfoId(8))
+    local raw = #(vector2(pos.x, pos.y) - vector2(wp.x, wp.y))
+    local val
+    if CodeStudio.MarkedLocation_Unit == 'Mi' then
+        val = string.format('%.2f', raw * 0.000621371)
+    else
+        val = string.format('%.2f', raw * 0.001)
+    end
+    return val .. ' ' .. CodeStudio.MarkedLocation_Unit
+end
 
+-- ── Weather ──────────────────────────────────────────────────
+local function GetWeatherType()
+    local hash = GetPrevWeatherTypeHashName()
+    for _, w in ipairs(WEATHER_TYPES) do
+        if w.hash == hash then return w.name end
+    end
+    return 'CLEAR'
+end
+
+-- ── Parking sensor ────────────────────────────────────────────
 local function StartParkingSensor()
-    if not CodeStudio.ParkingSensor.Enable then return end
-    if parkingThread then return end
-
-    parkingThread = CreateThread(function()
+    if not CodeStudio.ParkingSensor.Enable or parkThread then return end
+    parkThread = CreateThread(function()
         while isUIOpen do
             local ped = PlayerPedId()
             local veh = GetVehiclePedIsIn(ped, false)
-
             if veh ~= 0 and GetPedInVehicleSeat(veh, -1) == ped then
-                local speed    = GetEntitySpeed(veh) * 3.6
-                local dist     = CodeStudio.ParkingSensor.SensorDistance
-                local fwdVec   = GetEntityForwardVector(veh)
-                local pos      = GetEntityCoords(veh)
+                local fwd  = GetEntityForwardVector(veh)
+                local pos  = GetEntityCoords(veh)
+                local d    = CodeStudio.ParkingSensor.SensorDistance
 
-                -- Front sensor
-                local frontPos = vector3(pos.x + fwdVec.x * dist, pos.y + fwdVec.y * dist, pos.z)
-                local _, frontHit, _, _, _ = GetShapeTestResult(
-                    StartShapeTestRay(pos.x, pos.y, pos.z, frontPos.x, frontPos.y, frontPos.z, 10, veh, 0)
-                )
+                local _, fHit = GetShapeTestResult(StartShapeTestRay(
+                    pos.x, pos.y, pos.z,
+                    pos.x + fwd.x*d, pos.y + fwd.y*d, pos.z,
+                    10, veh, 0))
+                local _, bHit = GetShapeTestResult(StartShapeTestRay(
+                    pos.x, pos.y, pos.z,
+                    pos.x - fwd.x*d, pos.y - fwd.y*d, pos.z,
+                    10, veh, 0))
 
-                -- Rear sensor
-                local backPos = vector3(pos.x - fwdVec.x * dist, pos.y - fwdVec.y * dist, pos.z)
-                local _, backHit, _, _, _ = GetShapeTestResult(
-                    StartShapeTestRay(pos.x, pos.y, pos.z, backPos.x, backPos.y, backPos.z, 10, veh, 0)
-                )
-
-                SendUI('parkingSensor', { front = frontHit, back = backHit, speed = math.floor(speed) })
+                if fHit or bHit then
+                    NUI('syncUI', { action = 'parkAlarm' })
+                end
             end
-
-            Wait(200)
+            Wait(250)
         end
-        parkingThread = nil
+        parkThread = nil
     end)
 end
 
--- ── Hazard Light Loop ──────────────────────────────────────
-
-local function StartHazardLoop(veh)
+-- ── Hazard lights ────────────────────────────────────────────
+local function StartHazards(veh)
     if hazardThread then return end
     hazardActive = true
     hazardThread = CreateThread(function()
@@ -107,96 +129,58 @@ local function StartHazardLoop(veh)
     end)
 end
 
-local function StopHazardLoop(veh)
+local function StopHazards(veh)
     hazardActive = false
-    hazardThread = nil
     SetVehicleIndicatorLights(veh, 0, false)
     SetVehicleIndicatorLights(veh, 1, false)
 end
 
--- ── Music Neon RGB ─────────────────────────────────────────
+-- ── RGB neon ─────────────────────────────────────────────────
+local rgbColors = {
+    {255,0,0},{255,127,0},{255,255,0},{0,255,0},
+    {0,0,255},{75,0,130},{148,0,211}
+}
+local rgbIdx = 0
 
-local function StartRGBLoop(veh)
+local function StartRGB(veh)
     if rgbThread then return end
     rgbActive = true
-    neonColors = {
-        { r=255, g=0,   b=0   },
-        { r=255, g=127, b=0   },
-        { r=255, g=255, b=0   },
-        { r=0,   g=255, b=0   },
-        { r=0,   g=0,   b=255 },
-        { r=75,  g=0,   b=130 },
-        { r=148, g=0,   b=211 },
-    }
     rgbThread = CreateThread(function()
-        SetVehicleNeonLightsColour(veh, 255, 0, 0)
-        SetVehicleNeonLightEnabled(veh, 0, true)
-        SetVehicleNeonLightEnabled(veh, 1, true)
-        SetVehicleNeonLightEnabled(veh, 2, true)
-        SetVehicleNeonLightEnabled(veh, 3, true)
-
+        for i = 0, 3 do SetVehicleNeonLightEnabled(veh, i, true) end
         while rgbActive do
-            local col = neonColors[(neonIndex % #neonColors) + 1]
-            SetVehicleNeonLightsColour(veh, col.r, col.g, col.b)
-            neonIndex = neonIndex + 1
+            local c = rgbColors[(rgbIdx % #rgbColors) + 1]
+            SetVehicleNeonLightsColour(veh, c[1], c[2], c[3])
+            rgbIdx = rgbIdx + 1
             Wait(150)
         end
-
-        SetVehicleNeonLightEnabled(veh, 0, false)
-        SetVehicleNeonLightEnabled(veh, 1, false)
-        SetVehicleNeonLightEnabled(veh, 2, false)
-        SetVehicleNeonLightEnabled(veh, 3, false)
+        for i = 0, 3 do SetVehicleNeonLightEnabled(veh, i, false) end
         rgbThread = nil
     end)
 end
 
-local function StopRGBLoop()
+local function StopRGB()
     rgbActive = false
-    rgbThread = nil
 end
 
--- ── Auto Pilot ─────────────────────────────────────────────
-
+-- ── Autopilot ────────────────────────────────────────────────
 local function StopAutoPilot()
     autoPilotActive = false
-    autoPilotThread = nil
-
     local ped = PlayerPedId()
     local veh = GetVehiclePedIsIn(ped, false)
-    if veh ~= 0 then
-        ClearPedTasks(ped)
-        TaskVehicleTempAction(ped, veh, 27, 1)
-    end
-
-    if autoPilotBlip then
-        RemoveBlip(autoPilotBlip)
-        autoPilotBlip = nil
-    end
-
-    SendUI('autoPilotStatus', { active = false })
+    if veh ~= 0 then ClearPedTasks(ped) end
+    if autoPilotBlip then RemoveBlip(autoPilotBlip); autoPilotBlip = nil end
+    NUI('syncUI', { action = 'stopAutoDrive' })
     Notification(CodeStudio.Language.autopilot_off, 'inform')
-    exports.xsound:PlayUrlPos('cs_autopilot', 'nui://cs_carplay/ui/sound/autopilot_off.mp3', 1.0, vector3(0,0,0), false)
 end
 
-local function StartAutoPilot(targetCoords)
-    if autoPilotActive then StopAutoPilot() return end
-
+local function StartAutoPilot(coords)
     local ped = PlayerPedId()
     local veh = GetVehiclePedIsIn(ped, false)
-
-    if veh == 0 then
-        Notification(CodeStudio.Language.not_in_veh, 'error')
-        return
-    end
-    if not IsDriver() then
-        Notification(CodeStudio.Language.autopilot_driver, 'error')
-        return
-    end
+    if veh == 0 then return false end
 
     autoPilotActive = true
 
-    -- Place blip at target
-    autoPilotBlip = AddBlipForCoord(targetCoords.x, targetCoords.y, targetCoords.z)
+    autoPilotBlip = AddBlipForCoord(coords.x, coords.y, coords.z)
     SetBlipSprite(autoPilotBlip, 1)
     SetBlipColour(autoPilotBlip, 2)
     SetBlipScale(autoPilotBlip, 1.0)
@@ -206,118 +190,67 @@ local function StartAutoPilot(targetCoords)
 
     TaskVehicleDriveToCoordLongrange(
         ped, veh,
-        targetCoords.x, targetCoords.y, targetCoords.z,
+        coords.x, coords.y, coords.z,
         CodeStudio.AutoPilot.MaxSpeed,
         CodeStudio.AutoPilot.DriveStyle,
         5.0
     )
 
     Notification(CodeStudio.Language.autopilot_on, 'inform')
-    exports.xsound:PlayUrlPos('cs_autopilot', 'nui://cs_carplay/ui/sound/autopilot_on.mp3', 1.0, vector3(0,0,0), false)
-    SendUI('autoPilotStatus', { active = true })
 
-    autoPilotThread = CreateThread(function()
-        while autoPilotActive do
-            local pos    = GetEntityCoords(veh)
-            local dist   = #(vector3(pos.x, pos.y, pos.z) - vector3(targetCoords.x, targetCoords.y, targetCoords.z))
-            local speed  = GetEntitySpeed(veh) * 3.6
-            local gear   = GetVehicleCurrentGear(veh)
-            local rpm    = GetVehicleCurrentRpm(veh)
-
-            SendUI('dashboardUpdate', {
-                speed    = math.floor(speed),
-                rpm      = math.floor(rpm * 10000) / 10,
-                gear     = gear,
-                distance = math.floor(dist),
-            })
-
-            if dist < 8.0 then
-                StopAutoPilot()
-                return
-            end
-
-            -- Check if we're stuck
-            if speed < 1.0 and autoPilotActive then
-                Wait(3000)
-                if GetEntitySpeed(veh) * 3.6 < 1.0 and autoPilotActive then
-                    StopAutoPilot()
-                    return
-                end
-            end
-
-            Wait(500)
-        end
-    end)
-end
-
--- ── Dashboard update thread (when UI is open) ──────────────
-
-local function StartDashboardThread()
     CreateThread(function()
-        while isUIOpen do
-            local ped  = PlayerPedId()
-            local veh  = GetVehiclePedIsIn(ped, false)
+        while autoPilotActive do
+            local pos   = GetEntityCoords(veh)
+            local dist  = #(vector3(pos.x,pos.y,pos.z) - vector3(coords.x,coords.y,coords.z))
+            local speed = GetEntitySpeed(veh) * 3.6
+            local gear  = GetVehicleCurrentGear(veh)
+            local rpm   = GetVehicleCurrentRpm(veh)
 
-            if veh ~= 0 then
-                local speed  = GetEntitySpeed(veh) * 3.6
-                local rpm    = GetVehicleCurrentRpm(veh)
-                local gear   = GetVehicleCurrentGear(veh)
-                local fuel   = GetVehicleFuel(veh)
-                local body   = GetVehicleBodyHealth(veh)
-                local engine = GetVehicleEngineHealth(veh)
+            NUI('syncUI', { action = 'updateSpeed', data = {
+                speed = math.floor(speed), rpm = math.floor(rpm*100)/100,
+                gear  = gear, distance = math.floor(dist),
+            }})
 
-                -- Street / zone name
-                local pos       = GetEntityCoords(veh)
-                local streetHash, crossingHash = GetStreetNameAtCoord(pos.x, pos.y, pos.z)
-                local streetName = GetStreetNameFromHashKey(streetHash)
-                local zoneName   = GetNameOfZone(pos.x, pos.y, pos.z)
-
-                -- Map waypoint distance
-                local waypointDist = 0
-                if IsWaypointActive() then
-                    local wp = GetBlipCoords(GetFirstBlipInfoId(8))
-                    waypointDist = math.floor(#(vector2(pos.x, pos.y) - vector2(wp.x, wp.y)))
-                    if CodeStudio.MarkedLocation_Unit == 'Mi' then
-                        waypointDist = math.floor(waypointDist * 0.000621371 * 100) / 100
-                    else
-                        waypointDist = math.floor(waypointDist * 0.001 * 100) / 100
-                    end
-                end
-
-                SendUI('vehicleData', {
-                    speed    = math.floor(speed),
-                    rpm      = math.floor(rpm * 10000) / 10,
-                    gear     = gear,
-                    fuel     = math.floor(fuel),
-                    body     = math.floor(body / 10),
-                    engine   = math.floor(engine / 10),
-                    street   = streetName,
-                    zone     = zoneName,
-                    distance = waypointDist,
-                    unit     = CodeStudio.MarkedLocation_Unit,
-                })
-            end
-
+            if dist < 8.0 then StopAutoPilot(); return end
             Wait(500)
         end
     end)
+
+    return true
 end
 
--- ── Outside-vehicle music broadcast ────────────────────────
+-- ── Open / Close UI ──────────────────────────────────────────
 
-local function SyncMusicToNearby(data)
-    if CodeStudio.Music_Outside_Veh then
-        TriggerServerEvent('cs:carplay:syncMusic', data)
-    end
+local function BuildOpenUIData(veh)
+    local ped  = PlayerPedId()
+    local pos  = GetEntityCoords(veh)
+
+    local streetHash, _ = GetStreetNameAtCoord(pos.x, pos.y, pos.z)
+    local curLoc  = GetStreetNameFromHashKey(streetHash)
+    local locDist = GetWaypointDistance(pos)
+    local h, m    = GetClockHours(), GetClockMinutes()
+    local curTime = string.format('%02d:%02d', h, m)
+
+    return {
+        curVeh   = NetworkGetNetworkIdFromEntity(veh),
+        songData = {
+            musicPlaying = musicPlaying,
+            musicURL     = currentSong.url or '',
+            musicSrc     = currentSong.url or '',
+            title        = currentSong.title or '',
+            authorName   = currentSong.artist or '',
+            thumbnailUrl = currentSong.thumbnail or '',
+            musicEnd     = false,
+        },
+        vData = {
+            curLoc      = curLoc,
+            locDist     = locDist,
+            curTime     = curTime,
+            weatherType = GetWeatherType(),
+        },
+        loginData = nil, -- populated after login
+    }
 end
-
-local function StopMusicSync()
-    if CodeStudio.Music_Outside_Veh then
-        TriggerServerEvent('cs:carplay:stopSyncMusic')
-    end
-end
-
--- ── Open / Close UI ────────────────────────────────────────
 
 local function OpenUI()
     local ped = PlayerPedId()
@@ -327,29 +260,24 @@ local function OpenUI()
         Notification(CodeStudio.Language.not_in_veh, 'error')
         return
     end
-
     if CodeStudio.OnlyDriver and not IsDriver() then
         Notification(CodeStudio.Language.only_driver, 'error')
         return
     end
-
-    local model = GetEntityModel(veh)
-    if IsVehicleRestricted(model) then
+    if IsVehicleRestricted(GetEntityModel(veh)) then
         Notification(CodeStudio.Language.restricted_veh, 'error')
         return
     end
 
-    -- Radio install check
+    -- Radio install gate
     if CodeStudio.Main.RadioInstall.Enable then
-        local plate = GetVehiclePlate(veh)
-        TriggerServerEvent('cs:carplay:checkInstall', plate)
-        -- Response handled in cs:carplay:installStatus event below
+        TriggerServerEvent('cs:carplay:checkInstall', GetPlate(veh))
         return
     end
 
-    -- All checks passed – open the UI
-    isUIOpen     = true
+    isUIOpen       = true
     currentVehicle = veh
+    curVehNetId    = NetworkGetNetworkIdFromEntity(veh)
 
     if CodeStudio.Disable_GTA_Radio then
         SetVehicleRadioEnabled(veh, false)
@@ -357,273 +285,206 @@ local function OpenUI()
     end
 
     SetNuiFocus(true, true)
-
-    -- Fetch data from server (settings + playlist)
-    TriggerServerEvent('cs:carplay:fetchData')
-
+    NUI('openUI', BuildOpenUIData(veh))
     StartParkingSensor()
-    StartDashboardThread()
 end
 
 local function CloseUI()
     isUIOpen       = false
-    currentVehicle = nil
-
+    currentVehicle = 0
     SetNuiFocus(false, false)
-    SendUI('closeUI', {})
-
-    -- Stop autopilot if active
+    NUI('closeUI', {})
     if autoPilotActive then StopAutoPilot() end
-    -- Stop hazard loop
     if hazardActive then
-        local veh = GetPlayerVehicle()
-        if veh then StopHazardLoop(veh) end
+        local veh = GetVeh()
+        if veh ~= 0 then StopHazards(veh) end
+        hazardActive = false
     end
-    -- Stop RGB
-    if rgbActive then StopRGBLoop() end
+    if rgbActive then StopRGB() end
+    if frontCam  then DestroyCam(frontCam, false); frontCam = nil; RenderScriptCams(false,false,0,true,true) end
+    if backCam   then DestroyCam(backCam,  false); backCam  = nil; RenderScriptCams(false,false,0,true,true) end
 end
 
--- ── Event: Open UI ─────────────────────────────────────────
-
-RegisterNetEvent('cs:carPlay:openUI', function()
-    if isUIOpen then CloseUI() return end
-    OpenUI()
-end)
+-- ── Events: open / close ─────────────────────────────────────
 
 AddEventHandler('cs:carPlay:openUI', function()
-    if isUIOpen then CloseUI() return end
-    OpenUI()
+    if isUIOpen then CloseUI() else OpenUI() end
+end)
+RegisterNetEvent('cs:carPlay:openUI', function()
+    if isUIOpen then CloseUI() else OpenUI() end
 end)
 
--- ── Event: Server confirmed can open ──────────────────────
-
-RegisterNetEvent('cs:carPlay:canOpen', function(allowed)
-    if allowed then OpenUI() end
-end)
-
--- ── Event: Radio install status ────────────────────────────
+-- ── Event: radio install gate result ─────────────────────────
 
 RegisterNetEvent('cs:carplay:installStatus', function(installed)
+    local ped = PlayerPedId()
+    local veh = GetVehiclePedIsIn(ped, false)
+    if veh == 0 then return end
+
     if not installed then
-        Notification(CodeStudio.Language.not_installed, 'error')
+        -- Show the assemble card so player can install
+        NUI('installRadio', {
+            text = CodeStudio.Language.install_radio_txt,
+            data = { plate = GetPlate(veh), install = true },
+        })
         return
     end
-    -- Radio is installed, proceed
-    isUIOpen       = true
-    currentVehicle = GetPlayerVehicle()
 
-    if currentVehicle and CodeStudio.Disable_GTA_Radio then
-        SetVehicleRadioEnabled(currentVehicle, false)
-        SetVehicleRadioStation(currentVehicle, 'OFF')
+    isUIOpen       = true
+    currentVehicle = veh
+    curVehNetId    = NetworkGetNetworkIdFromEntity(veh)
+
+    if CodeStudio.Disable_GTA_Radio then
+        SetVehicleRadioEnabled(veh, false)
+        SetVehicleRadioStation(veh, 'OFF')
     end
 
     SetNuiFocus(true, true)
-    TriggerServerEvent('cs:carplay:fetchData')
+    NUI('openUI', BuildOpenUIData(veh))
     StartParkingSensor()
-    StartDashboardThread()
 end)
 
--- ── Event: Radio installed confirmation ───────────────────
+-- ── Event: radio installed confirmation ──────────────────────
 
 RegisterNetEvent('cs:carplay:radioInstalled', function(plate, installed)
+    NUI('syncUI', {
+        action = 'installRadio',
+        text   = installed and CodeStudio.Language.install_radio_txt or CodeStudio.Language.uninstall_radio_txt,
+        data   = { plate = plate, install = not installed },
+    })
     if installed then
         Notification('Radio installed in ' .. plate, 'success')
-        SendUI('radioInstalled', { plate = plate, installed = true })
     else
-        Notification('Radio uninstalled from ' .. plate, 'inform')
-        SendUI('radioInstalled', { plate = plate, installed = false })
+        Notification('Radio removed from ' .. plate, 'inform')
     end
 end)
 
--- ── Event: Server sent DB data ─────────────────────────────
+-- ── Events: server callback results → UI ─────────────────────
 
-RegisterNetEvent('cs:carplay:receiveData', function(data)
-    -- Get weather
-    local weatherHash = GetPrevWeatherTypeHashName()
-    local weatherName = 'CLEAR'
-    for _, w in ipairs(WEATHER_TYPES) do
-        if w.hash == weatherHash then
-            weatherName = w.name
-            break
+RegisterNetEvent('cs:carplay:appInfoResult', function(data)
+    -- Forwarded to UI via NUI callback response (handled in RegisterNUICallback below)
+    -- Store for use in NUI callback
+end)
+
+RegisterNetEvent('cs:carplay:loginResult', function(data)
+    NUI('syncUI', { action = 'login', data = data })
+end)
+
+RegisterNetEvent('cs:carplay:logoutResult', function()
+    NUI('syncUI', { action = 'logout' })
+end)
+
+RegisterNetEvent('cs:carplay:playlistResult', function(data)
+    NUI('syncUI', { action = 'playlistData', data = data })
+end)
+
+RegisterNetEvent('cs:carplay:saveMusicResult', function(id)
+    -- id is the DB insert id or nil on remove; handled inside saveMusic NUI callback
+    NUI('syncUI', { action = 'saveMusicResult', data = { id = id } })
+end)
+
+RegisterNetEvent('cs:carplay:clearPlaylistResult', function()
+    NUI('syncUI', { action = 'clearPlaylist' })
+end)
+
+RegisterNetEvent('cs:carplay:stopMusicResult', function()
+    exports.xsound:Destroy('cs_carplay_music')
+    musicPlaying = false
+    currentSong  = {}
+end)
+
+RegisterNetEvent('cs:carplay:musicPlayResult', function(volume)
+    musicVolume = math.floor(volume * 100)
+end)
+
+RegisterNetEvent('cs:carplay:likeSync', function(fromSrc, data)
+    -- Only update if we are not the source (handled in UI already for self)
+end)
+
+-- ── Nearby music ─────────────────────────────────────────────
+
+RegisterNetEvent('cs:carplay:nearbyMusicStart', function(fromSrc, data)
+    if fromSrc == GetPlayerServerId(PlayerId()) then return end
+    local tPed = GetPlayerPed(GetPlayerFromServerId(fromSrc))
+    if not tPed or tPed == 0 then return end
+    local tVeh = GetVehiclePedIsIn(tPed, false)
+    local pos  = tVeh ~= 0 and GetEntityCoords(tVeh) or GetEntityCoords(tPed)
+    local key  = 'cs_near_' .. fromSrc
+
+    exports.xsound:PlayUrlPos(key, data.url, data.volume or 0.3, pos, true)
+    exports.xsound:Distance(key, CodeStudio.Outside_Music_Distance)
+    if tVeh ~= 0 then exports.xsound:attachSound(key, tVeh) end
+end)
+
+RegisterNetEvent('cs:carplay:nearbyMusicStop', function(fromSrc)
+    exports.xsound:Destroy('cs_near_' .. fromSrc)
+end)
+
+-- ── GTA radio suppressor ─────────────────────────────────────
+
+CreateThread(function()
+    while true do
+        Wait(2000)
+        if isUIOpen and CodeStudio.Disable_GTA_Radio then
+            local veh = GetVeh()
+            if veh ~= 0 then
+                SetVehicleRadioEnabled(veh, false)
+                SetVehicleRadioStation(veh, 'OFF')
+            end
         end
     end
-
-    -- Get time
-    local hours, mins = GetClockHours(), GetClockMinutes()
-    local timeStr = string.format('%02d:%02d', hours, mins)
-
-    -- Get vehicle info
-    local ped  = PlayerPedId()
-    local veh  = GetVehiclePedIsIn(ped, false)
-    local vehName = ''
-    local plate   = ''
-    if veh ~= 0 then
-        vehName = GetDisplayNameFromVehicleModel(GetEntityModel(veh))
-        plate   = GetVehiclePlate(veh)
-    end
-
-    SendUI('openUI', {
-        settings        = data.settings,
-        playlist        = data.playlist,
-        defaultPlaylist = data.defaultPlaylist,
-        config          = data.config,
-        weather         = weatherName,
-        time            = timeStr,
-        vehName         = vehName,
-        plate           = plate,
-        language        = CodeStudio.Language,
-        apps            = CodeStudio.Apps,
-        defaultVolume   = CodeStudio.Default_Music_Volume,
-        distanceUnit    = CodeStudio.MarkedLocation_Unit,
-        onlyDriver      = CodeStudio.OnlyDriver,
-        autopilot       = CodeStudio.AutoPilot,
-        parkingSensor   = CodeStudio.ParkingSensor.Enable,
-    })
 end)
 
--- ── Event: Playlist saved ──────────────────────────────────
+-- ══════════════════════════════════════════════════════════════
+--  NUI CALLBACKS
+-- ══════════════════════════════════════════════════════════════
 
-RegisterNetEvent('cs:carplay:playlistSaved', function(success, reason)
-    if success then
-        SendUI('playlistSaved', { status = 'ok' })
-    end
-end)
-
-RegisterNetEvent('cs:carplay:songRemoved', function(url)
-    SendUI('songRemoved', { url = url })
-end)
-
-RegisterNetEvent('cs:carplay:playlistCleared', function()
-    SendUI('playlistCleared', {})
-end)
-
-RegisterNetEvent('cs:carplay:settingsReset', function()
-    SendUI('settingsReset', {})
-end)
-
-RegisterNetEvent('cs:carplay:allReset', function()
-    SendUI('allReset', {})
-end)
-
--- ── Event: Nearby player music ─────────────────────────────
-
-RegisterNetEvent('cs:carplay:nearbyMusic', function(playerSrc, data)
-    if playerSrc == GetPlayerServerId(PlayerId()) then return end
-    -- Handled by xSound proximity (client checks distance in thread)
-    -- Play at the vehicle position of the source player
-    local targetPed = GetPlayerPed(GetPlayerFromServerId(playerSrc))
-    if not targetPed or targetPed == 0 then return end
-
-    local targetVeh = GetVehiclePedIsIn(targetPed, false)
-    local pos = GetEntityCoords(targetPed)
-    if targetVeh ~= 0 then pos = GetEntityCoords(targetVeh) end
-
-    exports.xsound:PlayUrlPos(
-        'cs_nearby_' .. playerSrc,
-        data.url,
-        data.volume or 0.5,
-        pos,
-        true
-    )
-    exports.xsound:setVolume('cs_nearby_' .. playerSrc, data.volume or 0.5)
-    exports.xsound:Distance('cs_nearby_' .. playerSrc, CodeStudio.Outside_Music_Distance)
-end)
-
-RegisterNetEvent('cs:carplay:stopNearbyMusic', function(playerSrc)
-    exports.xsound:Destroy('cs_nearby_' .. playerSrc)
-end)
-
--- ── Notification helper ─────────────────────────────────────
--- Notification() is defined in config/client/cl_function.lua
-
--- ── NUI Callbacks ─────────────────────────────────────────
-
--- Close UI
-RegisterNUICallback('closeUI', function(data, cb)
-    CloseUI()
-    cb({ status = 'ok' })
-end)
-
--- Fetch app info / initial data
+-- /fetchAppInfo  ← called on window.load (before UI is shown)
 RegisterNUICallback('fetchAppInfo', function(data, cb)
-    -- Already sent via receiveData event; this is a secondary poll
-    local ped  = PlayerPedId()
-    local veh  = GetVehiclePedIsIn(ped, false)
-    local hours, mins = GetClockHours(), GetClockMinutes()
-
-    local weatherHash = GetPrevWeatherTypeHashName()
-    local weatherName = 'CLEAR'
-    for _, w in ipairs(WEATHER_TYPES) do
-        if w.hash == weatherHash then weatherName = w.name break end
-    end
-
     cb({
-        status      = 'ok',
-        time        = string.format('%02d:%02d', hours, mins),
-        weather     = weatherName,
-        vehName     = veh ~= 0 and GetDisplayNameFromVehicleModel(GetEntityModel(veh)) or '',
-        plate       = veh ~= 0 and GetVehiclePlate(veh) or '',
-        distanceUnit = CodeStudio.MarkedLocation_Unit,
-        apps        = CodeStudio.Apps,
-        language    = CodeStudio.Language,
-        defaultVolume = CodeStudio.Default_Music_Volume,
-        onlyDriver  = CodeStudio.OnlyDriver,
-        parkingSensor = CodeStudio.ParkingSensor.Enable,
+        enableApps      = CodeStudio.Apps,
+        Language        = CodeStudio.Language,
+        DefaultPlaylist = CodeStudio.Default_Playlist,
     })
 end)
 
--- Fetch playlist
+-- /loginAccount  ← {vehID}  →  {identifier, username}
+RegisterNUICallback('loginAccount', function(data, cb)
+    TriggerServerEvent('cs:carplay:loginAccount', data)
+    -- Response arrives via cs:carplay:loginResult → NUI syncUI/login
+    -- Also return immediately so the UI doesn't hang:
+    cb({ status = 'ok' })
+end)
+
+-- /logoutAccount  ← {vehID, login}
+RegisterNUICallback('logoutAccount', function(data, cb)
+    TriggerServerEvent('cs:carplay:logoutAccount', data)
+    cb({ status = 'ok' })
+end)
+
+-- /fetchPlaylist  ← {login}  →  [{id, musicData}]
 RegisterNUICallback('fetchPlaylist', function(data, cb)
-    -- Trigger server to resend playlist
-    TriggerServerEvent('cs:carplay:fetchData')
+    TriggerServerEvent('cs:carplay:fetchPlaylist', data)
     cb({ status = 'ok' })
 end)
 
--- Like / save song
+-- /saveMusic  ← {like, login, data, vehID} | {like:false, musicID, vehID}
+--              →  insertId (number) on save, nil on remove
+RegisterNUICallback('saveMusic', function(data, cb)
+    TriggerServerEvent('cs:carplay:saveMusic', data)
+    cb({ status = 'ok' })
+end)
+
+-- /likeData  ← {like, data, vehID}  (nearby broadcast)
 RegisterNUICallback('likeData', function(data, cb)
-    if not data or not data.url then cb({ status = 'error' }) return end
-    TriggerServerEvent('cs:carplay:saveToPlaylist', {
-        url       = data.url,
-        title     = data.title     or 'Unknown',
-        artist    = data.artist    or 'Unknown',
-        thumbnail = data.thumbnail or '',
-    })
-    -- Discord log
-    TriggerServerEvent('cs:carplay:logMusic', {
-        url    = data.url,
-        title  = data.title  or 'Unknown',
-        artist = data.artist or 'Unknown',
-    })
+    TriggerServerEvent('cs:carplay:likeData', data)
     cb({ status = 'ok' })
 end)
 
--- Remove song
-RegisterNUICallback('removeFromPlaylist', function(data, cb)
-    if not data or not data.url then cb({ status = 'error' }) return end
-    TriggerServerEvent('cs:carplay:removeFromPlaylist', data.url)
-    cb({ status = 'ok' })
-end)
+-- /musicPlay  ← {vehID, url, liked}  →  volume (0–1)
+RegisterNUICallback('musicPlay', function(data, cb)
+    if not data or not data.url then cb(0); return end
 
--- Clear playlist
-RegisterNUICallback('clearPlaylist', function(data, cb)
-    TriggerServerEvent('cs:carplay:clearPlaylist')
-    cb({ status = 'ok' })
-end)
-
--- Stop music
-RegisterNUICallback('stopMusic', function(data, cb)
-    exports.xsound:Destroy('cs_carplay_music')
-    StopMusicSync()
-    musicPlaying   = false
-    currentMusicData = {}
-    cb({ status = 'ok' })
-end)
-
--- Play music
-RegisterNUICallback('playMusic', function(data, cb)
-    if not data or not data.url then cb({ status = 'error' }) return end
-
-    -- Destroy old sound first
     exports.xsound:Destroy('cs_carplay_music')
 
     local ped = PlayerPedId()
@@ -633,419 +494,284 @@ RegisterNUICallback('playMusic', function(data, cb)
     if CodeStudio.Music_Outside_Veh then
         exports.xsound:PlayUrlPos('cs_carplay_music', data.url, musicVolume / 100, pos, true)
         exports.xsound:Distance('cs_carplay_music', CodeStudio.Outside_Music_Distance)
-        exports.xsound:attachSound('cs_carplay_music', veh ~= 0 and veh or ped)
+        if veh ~= 0 then exports.xsound:attachSound('cs_carplay_music', veh) end
     else
         exports.xsound:PlayUrl('cs_carplay_music', data.url, musicVolume / 100, true)
     end
 
-    musicPlaying   = true
-    currentMusicData = data
-    SyncMusicToNearby({ url = data.url, volume = musicVolume / 100 })
+    musicPlaying = true
+    currentSong  = { url = data.url }
+
+    -- Sync to nearby players
+    if CodeStudio.Music_Outside_Veh then
+        TriggerServerEvent('cs:carplay:syncMusicServer', { url = data.url, volume = musicVolume / 100 })
+    end
+
+    -- Discord log when playing
+    if CodeStudio.DiscordLog.Enable then
+        TriggerServerEvent('cs:carplay:logMusic', { url = data.url })
+    end
+
+    -- Return volume (0-1 scale) so UI sets the slider correctly
+    cb(musicVolume / 100)
+end)
+
+-- /stopMusic
+RegisterNUICallback('stopMusic', function(data, cb)
+    exports.xsound:Destroy('cs_carplay_music')
+    musicPlaying = false
+    currentSong  = {}
+    TriggerServerEvent('cs:carplay:stopSyncMusicServer')
     cb({ status = 'ok' })
 end)
 
--- Adjust volume
+-- /adjustVolume  ← {volume}  (0–100 from slider)
 RegisterNUICallback('adjustVolume', function(data, cb)
-    if not data or data.volume == nil then cb({ status = 'error' }) return end
+    if not data or data.volume == nil then cb({ status = 'error' }); return end
     musicVolume = tonumber(data.volume)
     exports.xsound:setVolume('cs_carplay_music', musicVolume / 100)
-    TriggerServerEvent('cs:carplay:saveSettings', { volume = musicVolume })
-    cb({ status = 'ok', volume = musicVolume })
+    cb({ status = 'ok' })
 end)
 
--- Loop toggle
+-- /loopMusic
 RegisterNUICallback('loopMusic', function(data, cb)
     musicLoop = not musicLoop
     exports.xsound:setLoop('cs_carplay_music', musicLoop)
     cb({ status = 'ok', loop = musicLoop })
 end)
 
--- Music timestamp
-RegisterNUICallback('musicTimeStamp', function(data, cb)
-    local ts = exports.xsound:getPosition('cs_carplay_music') or 0
-    cb({ status = 'ok', timestamp = ts })
-end)
-
--- Set music position (seek)
-RegisterNUICallback('setMusicPosition', function(data, cb)
-    if not data or data.position == nil then cb({ status = 'error' }) return end
-    exports.xsound:seek('cs_carplay_music', data.position)
+-- /clearPlaylist  ← {vehID, login}
+RegisterNUICallback('clearPlaylist', function(data, cb)
+    TriggerServerEvent('cs:carplay:clearPlaylist', data)
     cb({ status = 'ok' })
 end)
 
--- Auto pilot
-RegisterNUICallback('autoPilot', function(data, cb)
-    if not data then cb({ status = 'error' }) return end
-
-    if data.action == 'start' then
-        if not data.coords then
-            Notification(CodeStudio.Language.autopilot_error, 'error')
-            exports.xsound:PlayUrlPos('cs_autopilot_err', 'nui://cs_carplay/ui/sound/autopilot_error.mp3', 1.0, vector3(0,0,0), false)
-            cb({ status = 'error', msg = 'no_coords' })
-            return
-        end
-        StartAutoPilot(data.coords)
-        cb({ status = 'ok', active = true })
-    elseif data.action == 'stop' then
-        StopAutoPilot()
-        cb({ status = 'ok', active = false })
-    elseif data.action == 'getWaypoint' then
-        if IsWaypointActive() then
-            local wp = GetBlipCoords(GetFirstBlipInfoId(8))
-            cb({ status = 'ok', coords = { x = wp.x, y = wp.y, z = wp.z } })
-        else
-            cb({ status = 'error', msg = 'no_waypoint' })
-        end
-    else
-        cb({ status = 'error' })
-    end
-end)
-
--- Car dashboard data
-RegisterNUICallback('carDashboard', function(data, cb)
+-- /carInfo  → {vName, vBody, vFuel, vEngine, vTemp}
+RegisterNUICallback('carInfo', function(data, cb)
     local ped  = PlayerPedId()
     local veh  = GetVehiclePedIsIn(ped, false)
-    if veh == 0 then cb({ status = 'error' }) return end
-
-    local speed  = GetEntitySpeed(veh) * 3.6
-    local rpm    = GetVehicleCurrentRpm(veh)
-    local gear   = GetVehicleCurrentGear(veh)
-    local fuel   = GetVehicleFuel(veh)
-    local body   = GetVehicleBodyHealth(veh)
-    local engine = GetVehicleEngineHealth(veh)
-    local pos    = GetEntityCoords(veh)
-
-    local streetHash, _ = GetStreetNameAtCoord(pos.x, pos.y, pos.z)
-    local street = GetStreetNameFromHashKey(streetHash)
-    local zone   = GetNameOfZone(pos.x, pos.y, pos.z)
-
-    local waypointDist = 0
-    local unitLabel    = CodeStudio.MarkedLocation_Unit
-    if IsWaypointActive() then
-        local wp = GetBlipCoords(GetFirstBlipInfoId(8))
-        local raw = #(vector2(pos.x, pos.y) - vector2(wp.x, wp.y))
-        if unitLabel == 'Mi' then
-            waypointDist = math.floor(raw * 0.000621371 * 100) / 100
-        else
-            waypointDist = math.floor(raw * 0.001 * 100) / 100
-        end
-    end
+    if veh == 0 then cb(false); return end
 
     cb({
-        status   = 'ok',
-        speed    = math.floor(speed),
-        rpm      = math.floor(rpm * 10000) / 10,
-        gear     = gear,
-        fuel     = math.floor(fuel),
-        body     = math.floor(body / 10),
-        engine   = math.floor(engine / 10),
-        street   = street,
-        zone     = zone,
-        distance = waypointDist,
-        unit     = unitLabel,
-        autopilot = autoPilotActive,
+        vName   = GetDisplayNameFromVehicleModel(GetEntityModel(veh)),
+        vBody   = math.floor(GetVehicleBodyHealth(veh) / 10) .. '%',
+        vFuel   = math.floor(GetVehicleFuel(veh)) .. '%',
+        vEngine = math.floor(GetVehicleEngineHealth(veh) / 10) .. '%',
+        vTemp   = math.floor(GetVehicleEngineHealth(veh) / 10) .. '°C',
     })
 end)
 
--- Car action (doors, windows, seats)
+-- /carAction  ← {action, index}
 RegisterNUICallback('carAction', function(data, cb)
-    if not data then cb({ status = 'error' }) return end
-    local ped = PlayerPedId()
-    local veh = GetVehiclePedIsIn(ped, false)
-    if veh == 0 then cb({ status = 'error' }) return end
+    local veh = GetVeh()
+    if veh == 0 then cb({ status = 'error' }); return end
 
-    local action = data.action
-    local index  = tonumber(data.index)
+    local act   = data.action
+    local index = tonumber(data.index)
 
-    if action == 'door' then
-        if index == nil then cb({ status = 'error' }) return end
-        local isOpen = GetVehicleDoorAngleRatio(veh, index) > 0.1
-        if isOpen then
+    if act == 'door' then
+        local open = GetVehicleDoorAngleRatio(veh, index) > 0.1
+        if open then
             SetVehicleDoorShut(veh, index, false)
-        else
-            if not IsVehicleDoorDamaged(veh, index) then
-                SetVehicleDoorOpen(veh, index, false, false)
-            end
+        elseif not IsVehicleDoorDamaged(veh, index) then
+            SetVehicleDoorOpen(veh, index, false, false)
         end
-        cb({ status = 'ok', index = index, open = not isOpen })
+        cb({ status = 'ok', open = not open, index = index })
 
-    elseif action == 'alldoors' then
+    elseif act == 'alldoors' then
         local anyOpen = false
-        for i = 0, 5 do
-            if GetVehicleDoorAngleRatio(veh, i) > 0.1 then anyOpen = true break end
-        end
+        for i = 0, 5 do if GetVehicleDoorAngleRatio(veh, i) > 0.1 then anyOpen = true; break end end
         for i = 0, 5 do
             if not IsVehicleDoorDamaged(veh, i) then
-                if anyOpen then
-                    SetVehicleDoorShut(veh, i, false)
-                else
-                    SetVehicleDoorOpen(veh, i, false, false)
-                end
+                if anyOpen then SetVehicleDoorShut(veh, i, false)
+                else SetVehicleDoorOpen(veh, i, false, false) end
             end
         end
         cb({ status = 'ok', open = not anyOpen })
 
-    elseif action == 'window' then
-        if index == nil then cb({ status = 'error' }) return end
+    elseif act == 'window' then
         if IsVehicleWindowIntact(veh, index) then
             RollDownWindow(veh, index)
-            cb({ status = 'ok', index = index, open = true })
+            cb({ status = 'ok', open = true, index = index })
         else
             RollUpWindow(veh, index)
-            cb({ status = 'ok', index = index, open = false })
+            cb({ status = 'ok', open = false, index = index })
         end
 
-    elseif action == 'seat' then
-        -- Eject passenger from seat
-        if index == nil then cb({ status = 'error' }) return end
-        local occupant = GetPedInVehicleSeat(veh, index - 1) -- seat 10 = driver (-1)
-        if occupant ~= 0 and occupant ~= ped then
+    elseif act == 'seat' then
+        local seatIdx = index == 10 and -1 or (index)
+        local occupant = GetPedInVehicleSeat(veh, seatIdx)
+        if occupant ~= 0 and occupant ~= PlayerPedId() then
             TaskLeaveVehicle(occupant, veh, 16)
         end
         cb({ status = 'ok' })
-
     else
         cb({ status = 'error' })
     end
 end)
 
--- Car control (engine, lights, hazards, neon)
+-- /carControl  ← {type}
 RegisterNUICallback('carControl', function(data, cb)
-    if not data then cb({ status = 'error' }) return end
-    local ped = PlayerPedId()
-    local veh = GetVehiclePedIsIn(ped, false)
-    if veh == 0 then cb({ status = 'error' }) return end
+    local veh = GetVeh()
+    if veh == 0 then cb({ status = 'error' }); return end
+    local t = data.type
 
-    local ctrl = data.type
+    if t == 'engine' then
+        local on = GetIsVehicleEngineRunning(veh)
+        SetVehicleEngineOn(veh, not on, false, true)
+        cb({ status = 'ok', on = not on })
 
-    if ctrl == 'engine' then
-        local isOn = GetIsVehicleEngineRunning(veh)
-        SetVehicleEngineOn(veh, not isOn, false, true)
-        cb({ status = 'ok', on = not isOn })
-
-    elseif ctrl == 'headlight' then
+    elseif t == 'headlight' then
         local _, lights, _ = GetVehicleLightsState(veh)
-        SetVehicleLights(veh, lights == 1 and 0 or 2)
-        cb({ status = 'ok', on = lights ~= 1 })
+        local newState = (lights == 0) and 2 or 0
+        SetVehicleLights(veh, newState)
+        cb({ status = 'ok', on = newState ~= 0 })
 
-    elseif ctrl == 'hazard' then
+    elseif t == 'hazard' then
         if hazardActive then
-            StopHazardLoop(veh)
+            StopHazards(veh)
+            hazardActive = false
             cb({ status = 'ok', on = false })
         else
-            StartHazardLoop(veh)
+            StartHazards(veh)
             cb({ status = 'ok', on = true })
         end
 
-    elseif ctrl == 'musicrgb' then
+    elseif t == 'musicrgb' then
         if rgbActive then
-            StopRGBLoop()
+            StopRGB()
             cb({ status = 'ok', on = false })
         else
-            StartRGBLoop(veh)
+            StartRGB(veh)
             cb({ status = 'ok', on = true })
         end
-
     else
         cb({ status = 'error' })
     end
 end)
 
--- Camera
+-- /carCamera  ← {type: 'front'|'back'|'exit'}
 RegisterNUICallback('carCamera', function(data, cb)
-    if not data then cb({ status = 'error' }) return end
     local ped = PlayerPedId()
     local veh = GetVehiclePedIsIn(ped, false)
 
     if data.type == 'exit' then
-        if frontCam then DestroyCam(frontCam, false) frontCam = nil end
-        if backCam  then DestroyCam(backCam,  false) backCam  = nil end
-        cameraActive = false
+        if frontCam then DestroyCam(frontCam, false); frontCam = nil end
+        if backCam  then DestroyCam(backCam,  false); backCam  = nil end
         RenderScriptCams(false, false, 0, true, true)
-        cb({ status = 'ok' })
-        return
+        cb({ status = 'ok' }); return
     end
 
-    if veh == 0 then
-        cb({ status = 'error', msg = 'not_in_vehicle' })
-        return
-    end
-
-    local boneIndex
+    if veh == 0 then cb({ status = 'error', msg = 'not_in_vehicle' }); return end
 
     if data.type == 'front' then
-        -- Try to find front camera bone
-        boneIndex = GetEntityBoneIndexByName(veh, 'bonnet')
-        if boneIndex == -1 then
+        local bi = GetEntityBoneIndexByName(veh, 'bonnet')
+        if bi == -1 then
             Notification(CodeStudio.Language.no_camera_front, 'error')
-            cb({ status = 'error', msg = 'no_front_cam' })
-            return
+            cb({ status = 'error', msg = 'no_front_cam' }); return
         end
         if frontCam then DestroyCam(frontCam, false) end
-        local bonePos = GetWorldPositionOfEntityBone(veh, boneIndex)
-        frontCam = CreateCamWithParams('DEFAULT_SCRIPTED_CAMERA', bonePos.x, bonePos.y, bonePos.z + 0.3, 0.0, 0.0, GetEntityHeading(veh), 65.0, false, 0)
-        AttachCamToEntity(frontCam, veh, 0.0, 2.0, 0.5, true)
-        SetCamRot(frontCam, -10.0, 0.0, GetEntityHeading(veh), 2)
+        frontCam = CreateCamWithParams('DEFAULT_SCRIPTED_CAMERA', 0,0,0, -10,0, GetEntityHeading(veh), 65, false, 0)
+        AttachCamToEntity(frontCam, veh, 0.0, 2.2, 0.5, true)
         SetCamActive(frontCam, true)
         RenderScriptCams(true, false, 0, true, true)
-        cameraActive = true
         cb({ status = 'ok' })
 
     elseif data.type == 'back' then
-        boneIndex = GetEntityBoneIndexByName(veh, 'boot')
-        if boneIndex == -1 then
+        local bi = GetEntityBoneIndexByName(veh, 'boot')
+        if bi == -1 then
             Notification(CodeStudio.Language.no_camera_back, 'error')
-            cb({ status = 'error', msg = 'no_back_cam' })
-            return
+            cb({ status = 'error', msg = 'no_back_cam' }); return
         end
         if backCam then DestroyCam(backCam, false) end
-        local bonePos = GetWorldPositionOfEntityBone(veh, boneIndex)
-        backCam = CreateCamWithParams('DEFAULT_SCRIPTED_CAMERA', bonePos.x, bonePos.y, bonePos.z + 0.3, 0.0, 0.0, GetEntityHeading(veh) + 180.0, 65.0, false, 0)
-        AttachCamToEntity(backCam, veh, 0.0, -2.0, 0.5, true)
-        SetCamRot(backCam, -15.0, 0.0, GetEntityHeading(veh) + 180.0, 2)
+        backCam = CreateCamWithParams('DEFAULT_SCRIPTED_CAMERA', 0,0,0, -15,0, GetEntityHeading(veh)+180, 65, false, 0)
+        AttachCamToEntity(backCam, veh, 0.0, -2.2, 0.5, true)
         SetCamActive(backCam, true)
         RenderScriptCams(true, false, 0, true, true)
-        cameraActive = true
         cb({ status = 'ok' })
     else
         cb({ status = 'error' })
     end
 end)
 
--- AI/Siri chat
-RegisterNUICallback('chatGPTAction', function(data, cb)
-    if not data or not data.msg then cb({ status = 'error' }) return end
+-- /autoPilot  ← {action:'start'|'stop'|'getWaypoint', coords?}
+RegisterNUICallback('autoPilot', function(data, cb)
+    if data.action == 'getWaypoint' then
+        if IsWaypointActive() then
+            local wp = GetBlipCoords(GetFirstBlipInfoId(8))
+            cb({ status = 'ok', coords = { x = wp.x, y = wp.y, z = wp.z } })
+        else
+            Notification(CodeStudio.Language.autopilot_error, 'error')
+            exports.xsound:PlayUrlPos('cs_ap_err', 'nui://cs_carplay/ui/sound/autopilot_error.mp3', 0.5, vector3(0,0,0), false)
+            cb({ status = 'error', msg = 'no_waypoint' })
+        end
+    elseif data.action == 'start' then
+        if not IsDriver() then
+            Notification(CodeStudio.Language.autopilot_driver, 'error')
+            cb({ status = 'error', msg = 'not_driver' }); return
+        end
+        if data.coords then
+            StartAutoPilot(data.coords)
+            cb({ status = 'ok', active = true })
+        else
+            Notification(CodeStudio.Language.autopilot_error, 'error')
+            cb({ status = 'error', msg = 'no_coords' })
+        end
+    elseif data.action == 'stop' then
+        StopAutoPilot()
+        cb({ status = 'ok', active = false })
+    else
+        cb({ status = 'error' })
+    end
+end)
 
-    local msg     = string.lower(data.msg)
-    local ped     = PlayerPedId()
-    local veh     = GetVehiclePedIsIn(ped, false)
-    local answer  = nil
-    local actions = {}
+-- /chatGPTAction  ← {msg}  →  {answer, actions[]}
+RegisterNUICallback('chatGPTAction', function(data, cb)
+    if not data or not data.msg then cb({ status = 'error' }); return end
+    local msg    = string.lower(data.msg)
+    local answer = nil
 
     for _, entry in ipairs(CodeStudio.AI_Chat) do
-        for _, question in ipairs(entry.Questions) do
-            if string.find(msg, string.lower(question), 1, true) then
+        for _, q in ipairs(entry.Questions) do
+            if string.find(msg, string.lower(q), 1, true) then
                 answer = entry.Answer
-
-                -- Execute action if defined
-                if entry.action then
-                    pcall(entry.action, veh)
-                end
-
-                -- Close UI if requested
-                if entry.CloseUI then
-                    actions[#actions + 1] = 'closeUI'
-                    CloseUI()
-                end
-
-                -- Play music if URL detected in message
+                if entry.action then pcall(entry.action, GetVeh()) end
+                if entry.CloseUI then CloseUI() end
                 if entry.MusicURL then
-                    local url = string.match(data.msg, 'https?://[%w%-%.%?%=%&%+%/%%_#~]+')
+                    local url = string.match(data.msg, 'https?://[%S]+')
                     if url then
-                        actions[#actions + 1] = 'playMusic'
-                        actions.musicUrl = url
-                        -- Trigger play via UI
-                        SendUI('playMusicFromSiri', { url = url })
+                        -- Trigger play inside UI via message
+                        NUI('syncUI', { action = 'musicEntry', data = { musicSrc = url } })
                     end
                 end
-
                 break
             end
         end
         if answer then break end
     end
 
-    if not answer then
-        answer = "I'm sorry, I don't understand that request."
-    end
-
-    cb({ status = 'ok', answer = answer, actions = actions })
+    cb({ status = 'ok', answer = answer or "I'm sorry, I don't understand that." })
 end)
 
--- Save settings
-RegisterNUICallback('saveSettings', function(data, cb)
-    if not data then cb({ status = 'error' }) return end
-    TriggerServerEvent('cs:carplay:saveSettings', data)
-    cb({ status = 'ok' })
-end)
-
--- Reset settings
-RegisterNUICallback('resetSettings', function(data, cb)
-    TriggerServerEvent('cs:carplay:resetSettings')
-    cb({ status = 'ok' })
-end)
-
--- Reset playlist
-RegisterNUICallback('resetPlaylist', function(data, cb)
-    TriggerServerEvent('cs:carplay:clearPlaylist')
-    cb({ status = 'ok' })
-end)
-
--- Reset all
-RegisterNUICallback('resetAll', function(data, cb)
-    TriggerServerEvent('cs:carplay:resetAll')
-    cb({ status = 'ok' })
-end)
-
--- Logout
-RegisterNUICallback('logoutAccount', function(data, cb)
-    TriggerServerEvent('cs:carplay:saveSettings', { loggedIn = false })
-    cb({ status = 'ok' })
-end)
-
--- Login
-RegisterNUICallback('loginAccount', function(data, cb)
-    TriggerServerEvent('cs:carplay:saveSettings', { loggedIn = true })
-    cb({ status = 'ok' })
-end)
-
--- Install radio (from assemble card in UI)
+-- /installRadio  ← {plate, install}
 RegisterNUICallback('installRadio', function(data, cb)
-    if not data then cb({ status = 'error' }) return end
-    local ped = PlayerPedId()
-    local veh = GetVehiclePedIsIn(ped, false)
-
+    local veh = GetVeh()
     if veh == 0 then
         Notification(CodeStudio.Language.not_in_veh_install, 'error')
-        cb({ status = 'error' })
-        return
+        cb({ status = 'error' }); return
     end
-
-    local plate = GetVehiclePlate(veh)
-    InstallRadio(plate, data.install)
+    InstallRadio(GetPlate(veh), data.install)
     cb({ status = 'ok' })
 end)
 
--- Map open (for AI or map button)
+-- /closeUI
+RegisterNUICallback('closeUI', function(data, cb)
+    CloseUI()
+    cb({ status = 'ok' })
+end)
+
+-- /openMap
 RegisterNUICallback('openMap', function(data, cb)
     openMap()
     cb({ status = 'ok' })
-end)
-
--- ── GTA Radio suppression thread ───────────────────────────
-
-CreateThread(function()
-    while true do
-        Wait(1000)
-        if isUIOpen and CodeStudio.Disable_GTA_Radio then
-            local ped = PlayerPedId()
-            local veh = GetVehiclePedIsIn(ped, false)
-            if veh ~= 0 then
-                SetVehicleRadioEnabled(veh, false)
-                SetVehicleRadioStation(veh, 'OFF')
-            end
-        end
-    end
-end)
-
--- ── Clock update thread ────────────────────────────────────
-
-CreateThread(function()
-    while true do
-        Wait(30000)
-        if isUIOpen then
-            local h, m = GetClockHours(), GetClockMinutes()
-            SendUI('updateTime', { time = string.format('%02d:%02d', h, m) })
-        end
-    end
 end)

@@ -1,43 +1,69 @@
 -- ============================================================
 --  cs_carplay  |  main/server.lua
---  Full server-side logic: database, framework, webhooks,
---  radio installation, playlist & settings persistence.
+--  Full server-side logic matching the deobfuscated UI contracts.
+--
+--  NUI endpoints implemented (RegisterNUICallback in client.lua):
+--    /fetchAppInfo        → {enableApps, Language, DefaultPlaylist}
+--    /loginAccount        → {identifier, username}
+--    /logoutAccount       ← {vehID, login}
+--    /fetchPlaylist       ← {login}  →  [{id, musicData}]
+--    /saveMusic           ← {like, login, data, vehID} | {like:false, musicID}
+--    /likeData            ← {like, data, vehID}  (nearby sync broadcast)
+--    /clearPlaylist       ← {vehID, login}
+--    /musicPlay           ← {vehID, url, liked}  → volume (number)
+--    /adjustVolume        ← {volume}
+--    /loopMusic           ← {}
+--    /carInfo             → {vName, vBody, vFuel, vEngine, vTemp}
+--    /carAction           ← {action, index}
+--    /carControl          ← {type}
+--    /carCamera           ← {type}
+--    /autoPilot           ← {action, coords?}
+--    /chatGPTAction       ← {msg}
+--    /installRadio        ← install data
+--    /closeUI             ← {}
+--    /openMap             ← {}
+--
+--  Server events:
+--    cs:carplay:addInstall  (plate, install)  ← cl_function.lua
+--    cs:carplay:checkInstall (plate)
+--    cs:carplay:syncMusic   / cs:carplay:stopSyncMusic
 -- ============================================================
 
 local ESX, QBCore
 
--- ── Framework bootstrap ────────────────────────────────────
+-- ── Framework bootstrap ─────────────────────────────────────
 if CodeStudio.ServerType == 'ESX' then
     TriggerEvent('esx:getSharedObject', function(obj) ESX = obj end)
 elseif CodeStudio.ServerType == 'QB' then
     QBCore = exports['qb-core']:GetCoreObject()
 end
 
--- ── Auto SQL ───────────────────────────────────────────────
+-- ── Auto SQL ────────────────────────────────────────────────
 if CodeStudio.AutoSQL then
+    -- Users table: stores identifier → username mapping (populated on first login)
     MySQL.query([[
         CREATE TABLE IF NOT EXISTS `cs_carplay_users` (
-            `id`         int(11)       NOT NULL AUTO_INCREMENT,
-            `identifier` varchar(100)  NOT NULL,
-            `settings`   longtext      DEFAULT NULL,
+            `id`         int(11)      NOT NULL AUTO_INCREMENT,
+            `identifier` varchar(100) NOT NULL,
+            `username`   varchar(100) DEFAULT NULL,
             PRIMARY KEY (`id`),
             UNIQUE KEY `identifier` (`identifier`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     ]])
 
+    -- Playlist table: musicData stored as JSON string
+    -- (matches JS structure: {musicSrc, title, authorName, thumbnailUrl, saved:true})
     MySQL.query([[
         CREATE TABLE IF NOT EXISTS `cs_carplay_playlist` (
-            `id`         int(11)       NOT NULL AUTO_INCREMENT,
-            `identifier` varchar(100)  NOT NULL,
-            `url`        varchar(1000) NOT NULL,
-            `title`      varchar(255)  DEFAULT NULL,
-            `artist`     varchar(255)  DEFAULT NULL,
-            `thumbnail`  varchar(1000) DEFAULT NULL,
+            `id`         int(11)      NOT NULL AUTO_INCREMENT,
+            `identifier` varchar(100) NOT NULL,
+            `musicData`  longtext     NOT NULL,
             PRIMARY KEY (`id`),
             KEY `idx_identifier` (`identifier`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     ]])
 
+    -- Radio installation table
     if CodeStudio.Main.RadioInstall.Enable then
         MySQL.query([[
             CREATE TABLE IF NOT EXISTS `cs_carplay_radio` (
@@ -48,75 +74,63 @@ if CodeStudio.AutoSQL then
     end
 end
 
--- ── Helpers ────────────────────────────────────────────────
+-- ── Helpers ─────────────────────────────────────────────────
 
 local function GetIdentifier(src)
     for _, v in ipairs(GetPlayerIdentifiers(src)) do
         if string.sub(v, 1, 8) == 'license:' then return v end
     end
-    return tostring(src)
+    return 'license:' .. tostring(src)
 end
 
-local function GetPlayerData(src)
+local function GetPlayerName(src)
+    return GetPlayerName(src) or 'Player'
+end
+
+local function GetFrameworkPlayer(src)
     if CodeStudio.ServerType == 'ESX' then
-        local xPlayer = ESX.GetPlayerFromId(src)
-        if xPlayer then
-            return {
-                identifier = xPlayer.identifier,
-                name       = xPlayer.getName(),
-                job        = xPlayer.getJob().name,
-                group      = xPlayer.getGroup(),
-            }
-        end
+        return ESX.GetPlayerFromId(src)
     elseif CodeStudio.ServerType == 'QB' then
-        local player = QBCore.Functions.GetPlayer(src)
-        if player then
-            local ci = player.PlayerData.charinfo
-            return {
-                identifier = player.PlayerData.citizenid,
-                name       = ci.firstname .. ' ' .. ci.lastname,
-                job        = player.PlayerData.job.name,
-                group      = player.PlayerData.group,
-            }
-        end
-    else
-        return {
-            identifier = GetIdentifier(src),
-            name       = GetPlayerName(src),
-            job        = '',
-            group      = 'user',
-        }
+        return QBCore.Functions.GetPlayer(src)
     end
     return nil
+end
+
+local function GetPlayerJob(src)
+    if CodeStudio.ServerType == 'ESX' then
+        local xP = ESX.GetPlayerFromId(src)
+        if xP then return xP.getJob().name end
+    elseif CodeStudio.ServerType == 'QB' then
+        local p = QBCore.Functions.GetPlayer(src)
+        if p then return p.PlayerData.job.name end
+    end
+    return ''
 end
 
 local function HasAccess(src)
     local restrictList = CodeStudio.Main.Restrict_Radio
     if not restrictList or #restrictList == 0 then return true end
 
-    local identifier  = GetIdentifier(src)
-    local playerData  = GetPlayerData(src)
+    local identifier = GetIdentifier(src)
+    local job        = GetPlayerJob(src)
 
     for _, rule in ipairs(restrictList) do
-        -- ace permission
-        if IsPlayerAceAllowed(src, rule) then return true end
-        -- direct identifier match
-        if identifier == rule then return true end
-        -- any identifier (e.g. discord:)
+        if IsPlayerAceAllowed(src, rule)                          then return true end
+        if identifier == rule                                     then return true end
+        if job        == rule                                     then return true end
         for _, id in ipairs(GetPlayerIdentifiers(src)) do
-            if id == rule then return true end
+            if id == rule                                         then return true end
         end
-        -- job match (framework)
-        if playerData and playerData.job == rule then return true end
     end
     return false
 end
 
--- ── Discord Webhook ────────────────────────────────────────
+-- ── Discord Webhook ─────────────────────────────────────────
 
 local function DiscordLog(data)
-    if not CodeStudio.DiscordLog.Enable then return end
-    if not CodeStudio.DiscordLog.Play_Webhook or CodeStudio.DiscordLog.Play_Webhook == '' then return end
+    if not CodeStudio.DiscordLog.Enable                           then return end
+    if not CodeStudio.DiscordLog.Play_Webhook
+    or CodeStudio.DiscordLog.Play_Webhook == ''                   then return end
 
     local payload = json.encode({
         username = 'CarPlay Music Logger',
@@ -143,189 +157,193 @@ local function DiscordLog(data)
     )
 end
 
--- ── Access gate ────────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════════
+--  NUI CALLBACK HANDLERS
+--  (registered from client.lua via RegisterNUICallback)
+--  The client triggers server events for DB ops; results come
+--  back via TriggerClientEvent → SendNUIMessage.
+-- ══════════════════════════════════════════════════════════════
 
-RegisterNetEvent('cs:carPlay:requestOpen', function()
+-- ── /fetchAppInfo ────────────────────────────────────────────
+--  Called once on window.load. Returns config for setApps().
+RegisterNetEvent('cs:carplay:fetchAppInfo', function()
     local src = source
-    if not HasAccess(src) then
-        TriggerClientEvent('cs:carPlay:notification', src, CodeStudio.Language.not_allowed, 'error')
-        return
-    end
-    TriggerClientEvent('cs:carPlay:canOpen', src, true)
+    TriggerClientEvent('cs:carplay:appInfoResult', src, {
+        enableApps      = CodeStudio.Apps,
+        Language        = CodeStudio.Language,
+        DefaultPlaylist = CodeStudio.Default_Playlist,
+    })
 end)
 
--- ── Fetch all user data for UI init ───────────────────────
+-- ── /loginAccount ────────────────────────────────────────────
+--  body: {vehID}
+--  Returns: {identifier, username} — loginID used in all playlist ops.
+RegisterNetEvent('cs:carplay:loginAccount', function(data)
+    local src        = source
+    local identifier = GetIdentifier(src)
+    local name       = GetPlayerName(src)
 
-RegisterNetEvent('cs:carplay:fetchData', function()
+    -- Upsert user record
+    MySQL.query(
+        'INSERT INTO cs_carplay_users (identifier, username) VALUES (?, ?) ON DUPLICATE KEY UPDATE username = VALUES(username)',
+        { identifier, name }
+    )
+
+    TriggerClientEvent('cs:carplay:loginResult', src, {
+        identifier = identifier,
+        username   = name,
+    })
+end)
+
+-- ── /logoutAccount ───────────────────────────────────────────
+--  body: {vehID, login}
+RegisterNetEvent('cs:carplay:logoutAccount', function(data)
+    -- Nothing persisted for logout; just broadcast syncUI logout to nearby
+    local src = source
+    TriggerClientEvent('cs:carplay:logoutResult', src, true)
+end)
+
+-- ── /fetchPlaylist ───────────────────────────────────────────
+--  body: {login}  (login = identifier string)
+--  Returns: [{id, musicData}] where musicData is a JSON string
+RegisterNetEvent('cs:carplay:fetchPlaylist', function(data)
     local src        = source
     local identifier = GetIdentifier(src)
 
     MySQL.query(
-        'SELECT settings FROM cs_carplay_users WHERE identifier = ? LIMIT 1',
+        'SELECT id, musicData FROM cs_carplay_playlist WHERE identifier = ? ORDER BY id ASC',
         { identifier },
-        function(settingsResult)
-            local settings = nil
-            if settingsResult and settingsResult[1] then
-                settings = json.decode(settingsResult[1].settings or 'null')
-            end
+        function(result)
+            TriggerClientEvent('cs:carplay:playlistResult', src, result or {})
+        end
+    )
+end)
 
-            MySQL.query(
-                'SELECT url, title, artist, thumbnail FROM cs_carplay_playlist WHERE identifier = ? ORDER BY id ASC',
-                { identifier },
-                function(playlist)
-                    TriggerClientEvent('cs:carplay:receiveData', src, {
-                        settings        = settings,
-                        playlist        = playlist or {},
-                        defaultPlaylist = CodeStudio.Default_Playlist,
-                        config          = {
-                            defaultVolume = CodeStudio.Default_Music_Volume,
-                            apps          = CodeStudio.Apps,
-                            language      = CodeStudio.Language,
-                            autoPilot     = CodeStudio.AutoPilot,
-                            distanceUnit  = CodeStudio.MarkedLocation_Unit,
-                            onlyDriver    = CodeStudio.OnlyDriver,
-                        },
+-- ── /saveMusic ───────────────────────────────────────────────
+--  body (save):   {like:true,  login, data:{musicSrc,title,authorName,thumbnailUrl}, vehID}
+--  body (remove): {like:false, musicID, vehID}
+--  Returns: on save → DB insert id (number); on remove → nothing
+RegisterNetEvent('cs:carplay:saveMusic', function(data)
+    local src        = source
+    local identifier = GetIdentifier(src)
+
+    if data.like then
+        -- Save to DB
+        local musicData = json.encode(data.data)
+        MySQL.insert(
+            'INSERT INTO cs_carplay_playlist (identifier, musicData) VALUES (?, ?)',
+            { identifier, musicData },
+            function(insertId)
+                TriggerClientEvent('cs:carplay:saveMusicResult', src, insertId)
+
+                -- Discord log
+                if data.data then
+                    DiscordLog({
+                        playerName  = GetPlayerName(src),
+                        identifier  = identifier,
+                        title       = data.data.title       or 'Unknown',
+                        artist      = data.data.authorName  or 'Unknown',
+                        url         = data.data.musicSrc    or '',
                     })
                 end
-            )
-        end
-    )
-end)
-
--- ── Save / reset settings ──────────────────────────────────
-
-RegisterNetEvent('cs:carplay:saveSettings', function(settings)
-    local src        = source
-    local identifier = GetIdentifier(src)
-    if not identifier then return end
-
-    MySQL.query(
-        'INSERT INTO cs_carplay_users (identifier, settings) VALUES (?, ?) ON DUPLICATE KEY UPDATE settings = VALUES(settings)',
-        { identifier, json.encode(settings) }
-    )
-end)
-
-RegisterNetEvent('cs:carplay:resetSettings', function()
-    local src        = source
-    local identifier = GetIdentifier(src)
-    if not identifier then return end
-
-    MySQL.query(
-        'UPDATE cs_carplay_users SET settings = NULL WHERE identifier = ?',
-        { identifier },
-        function()
-            TriggerClientEvent('cs:carplay:settingsReset', src)
-        end
-    )
-end)
-
--- ── Playlist management ────────────────────────────────────
-
-RegisterNetEvent('cs:carplay:saveToPlaylist', function(data)
-    local src        = source
-    local identifier = GetIdentifier(src)
-    if not identifier or not data or not data.url then return end
-
-    -- Prevent duplicates
-    MySQL.query(
-        'SELECT id FROM cs_carplay_playlist WHERE identifier = ? AND url = ? LIMIT 1',
-        { identifier, data.url },
-        function(existing)
-            if existing and existing[1] then
-                TriggerClientEvent('cs:carplay:playlistSaved', src, false, 'duplicate')
-                return
             end
+        )
+    else
+        -- Remove from DB
+        if data.musicID then
             MySQL.query(
-                'INSERT INTO cs_carplay_playlist (identifier, url, title, artist, thumbnail) VALUES (?, ?, ?, ?, ?)',
-                {
-                    identifier,
-                    data.url       or '',
-                    data.title     or 'Unknown',
-                    data.artist    or 'Unknown',
-                    data.thumbnail or '',
-                },
-                function(result)
-                    TriggerClientEvent('cs:carplay:playlistSaved', src, result ~= nil, 'ok')
-                end
+                'DELETE FROM cs_carplay_playlist WHERE id = ? AND identifier = ?',
+                { tonumber(data.musicID), identifier }
             )
         end
-    )
+        TriggerClientEvent('cs:carplay:saveMusicResult', src, nil)
+    end
 end)
 
-RegisterNetEvent('cs:carplay:removeFromPlaylist', function(url)
-    local src        = source
-    local identifier = GetIdentifier(src)
-    if not identifier or not url then return end
-
-    MySQL.query(
-        'DELETE FROM cs_carplay_playlist WHERE identifier = ? AND url = ?',
-        { identifier, url },
-        function()
-            TriggerClientEvent('cs:carplay:songRemoved', src, url)
-        end
-    )
+-- ── /likeData ────────────────────────────────────────────────
+--  body: {like, data, vehID}
+--  Syncs the like state to nearby players (so their UI updates in real-time)
+RegisterNetEvent('cs:carplay:likeData', function(data)
+    local src = source
+    -- Broadcast to all clients so nearby players can see the liked song in overlay
+    TriggerClientEvent('cs:carplay:likeSync', -1, src, data)
 end)
 
-RegisterNetEvent('cs:carplay:clearPlaylist', function()
+-- ── /musicPlay ───────────────────────────────────────────────
+--  body: {vehID, url, liked}
+--  Returns: volume (number, 0-1)  ← JS does: $(".volume-slider").val(result * 100)
+RegisterNetEvent('cs:carplay:musicPlay', function(data)
+    local src    = source
+    local volume = (CodeStudio.Default_Music_Volume or 20) / 100
+
+    -- Start xSound music on client (done in client.lua NUI callback)
+    -- Just return the volume so the slider is set correctly
+    TriggerClientEvent('cs:carplay:musicPlayResult', src, volume)
+
+    -- Broadcast nearby music sync
+    if CodeStudio.Music_Outside_Veh then
+        TriggerClientEvent('cs:carplay:nearbyMusicStart', -1, src, {
+            url    = data.url,
+            volume = volume,
+        })
+    end
+end)
+
+-- ── /clearPlaylist ───────────────────────────────────────────
+--  body: {vehID, login}
+RegisterNetEvent('cs:carplay:clearPlaylist', function(data)
     local src        = source
     local identifier = GetIdentifier(src)
-    if not identifier then return end
 
     MySQL.query(
         'DELETE FROM cs_carplay_playlist WHERE identifier = ?',
         { identifier },
         function()
-            TriggerClientEvent('cs:carplay:playlistCleared', src)
+            TriggerClientEvent('cs:carplay:clearPlaylistResult', src)
         end
     )
 end)
 
--- ── Full factory reset ─────────────────────────────────────
-
-RegisterNetEvent('cs:carplay:resetAll', function()
-    local src        = source
-    local identifier = GetIdentifier(src)
-    if not identifier then return end
-
-    MySQL.query('DELETE FROM cs_carplay_playlist WHERE identifier = ?', { identifier })
-    MySQL.query(
-        'UPDATE cs_carplay_users SET settings = NULL WHERE identifier = ?',
-        { identifier },
-        function()
-            TriggerClientEvent('cs:carplay:allReset', src)
-        end
-    )
-end)
-
--- ── Music logging ──────────────────────────────────────────
-
-RegisterNetEvent('cs:carplay:logMusic', function(data)
-    local src        = source
-    local playerData = GetPlayerData(src)
-    if playerData then
-        data.playerName = playerData.name
-        data.identifier = playerData.identifier
+-- ── /stopMusic ───────────────────────────────────────────────
+RegisterNetEvent('cs:carplay:stopMusic', function()
+    local src = source
+    if CodeStudio.Music_Outside_Veh then
+        TriggerClientEvent('cs:carplay:nearbyMusicStop', -1, src)
     end
-    DiscordLog(data)
+    TriggerClientEvent('cs:carplay:stopMusicResult', src)
 end)
 
--- ── Radio Installation ─────────────────────────────────────
+-- ── /adjustVolume ────────────────────────────────────────────
+RegisterNetEvent('cs:carplay:adjustVolume', function(data)
+    -- handled entirely client-side via xSound; server just ACKs
+    local src = source
+    TriggerClientEvent('cs:carplay:adjustVolumeResult', src, data.volume)
+end)
+
+-- ── /carInfo ─────────────────────────────────────────────────
+--  Returns: {vName, vBody, vFuel, vEngine, vTemp}
+RegisterNetEvent('cs:carplay:carInfo', function()
+    local src = source
+    -- The actual vehicle data is computed client-side in the NUI callback;
+    -- this event is fired as fallback if needed
+    TriggerClientEvent('cs:carplay:carInfoResult', src, nil)
+end)
+
+-- ══════════════════════════════════════════════════════════════
+--  SERVER EVENTS (from client game-code, not NUI)
+-- ══════════════════════════════════════════════════════════════
+
+-- ── Radio Installation ───────────────────────────────────────
 
 local function HasRadioItem(src)
     local item = CodeStudio.Main.RadioInstall.Options.RadioItem
     if not item then return true end
-
     if CodeStudio.ServerType == 'ESX' then
-        local xPlayer = ESX.GetPlayerFromId(src)
-        if xPlayer then
-            local inv = xPlayer.getInventoryItem(item)
-            return inv and inv.count > 0
-        end
+        local xP = ESX.GetPlayerFromId(src)
+        if xP then local inv = xP.getInventoryItem(item); return inv and inv.count > 0 end
     elseif CodeStudio.ServerType == 'QB' then
-        local player = QBCore.Functions.GetPlayer(src)
-        if player then
-            return player.Functions.GetItemByName(item) ~= nil
-        end
+        local p = QBCore.Functions.GetPlayer(src)
+        if p then return p.Functions.GetItemByName(item) ~= nil end
     else
         return true
     end
@@ -335,46 +353,33 @@ end
 local function RemoveRadioItem(src)
     local item = CodeStudio.Main.RadioInstall.Options.RadioItem
     if not item then return end
-
     if CodeStudio.ServerType == 'ESX' then
-        local xPlayer = ESX.GetPlayerFromId(src)
-        if xPlayer then xPlayer.removeInventoryItem(item, 1) end
+        local xP = ESX.GetPlayerFromId(src); if xP then xP.removeInventoryItem(item, 1) end
     elseif CodeStudio.ServerType == 'QB' then
-        local player = QBCore.Functions.GetPlayer(src)
-        if player then player.Functions.RemoveItem(item, 1) end
+        local p = QBCore.Functions.GetPlayer(src); if p then p.Functions.RemoveItem(item, 1) end
     end
 end
 
 local function GiveRadioItem(src)
     local item = CodeStudio.Main.RadioInstall.Options.RadioItem
     if not item then return end
-
     if CodeStudio.ServerType == 'ESX' then
-        local xPlayer = ESX.GetPlayerFromId(src)
-        if xPlayer then xPlayer.addInventoryItem(item, 1) end
+        local xP = ESX.GetPlayerFromId(src); if xP then xP.addInventoryItem(item, 1) end
     elseif CodeStudio.ServerType == 'QB' then
-        local player = QBCore.Functions.GetPlayer(src)
-        if player then player.Functions.AddItem(item, 1) end
+        local p = QBCore.Functions.GetPlayer(src); if p then p.Functions.AddItem(item, 1) end
     end
 end
 
 RegisterNetEvent('cs:carplay:addInstall', function(plate, install)
     local src = source
     if not CodeStudio.Main.RadioInstall.Enable then return end
-    if not plate then return end
-
-    plate = string.upper(string.gsub(plate, '%s+', ''))
+    plate = string.upper(string.gsub(tostring(plate), '%s+', ''))
 
     if install then
-        -- Require radio item
-        if CodeStudio.Main.RadioInstall.Options.RadioItem then
-            if not HasRadioItem(src) then
-                TriggerClientEvent('cs:carplay:notification', src, CodeStudio.Language.no_radio_item, 'error')
-                return
-            end
+        if CodeStudio.Main.RadioInstall.Options.RadioItem and not HasRadioItem(src) then
+            TriggerClientEvent('cs:carplay:notification', src, CodeStudio.Language.no_radio_item, 'error')
+            return
         end
-
-        -- Optional: only owned vehicles
         if CodeStudio.Main.RadioInstall.Options.OnlyOwned then
             local identifier = GetIdentifier(src)
             MySQL.query(
@@ -385,36 +390,23 @@ RegisterNetEvent('cs:carplay:addInstall', function(plate, install)
                         TriggerClientEvent('cs:carplay:notification', src, CodeStudio.Language.veh_not_owned, 'error')
                         return
                     end
-                    MySQL.query(
-                        'INSERT IGNORE INTO cs_carplay_radio (plate) VALUES (?)',
-                        { plate },
-                        function()
-                            RemoveRadioItem(src)
-                            TriggerClientEvent('cs:carplay:radioInstalled', src, plate, true)
-                        end
-                    )
+                    MySQL.query('INSERT IGNORE INTO cs_carplay_radio (plate) VALUES (?)', { plate }, function()
+                        RemoveRadioItem(src)
+                        TriggerClientEvent('cs:carplay:radioInstalled', src, plate, true)
+                    end)
                 end
             )
         else
-            MySQL.query(
-                'INSERT IGNORE INTO cs_carplay_radio (plate) VALUES (?)',
-                { plate },
-                function()
-                    RemoveRadioItem(src)
-                    TriggerClientEvent('cs:carplay:radioInstalled', src, plate, true)
-                end
-            )
+            MySQL.query('INSERT IGNORE INTO cs_carplay_radio (plate) VALUES (?)', { plate }, function()
+                RemoveRadioItem(src)
+                TriggerClientEvent('cs:carplay:radioInstalled', src, plate, true)
+            end)
         end
     else
-        -- Uninstall
-        MySQL.query(
-            'DELETE FROM cs_carplay_radio WHERE plate = ?',
-            { plate },
-            function()
-                GiveRadioItem(src)
-                TriggerClientEvent('cs:carplay:radioInstalled', src, plate, false)
-            end
-        )
+        MySQL.query('DELETE FROM cs_carplay_radio WHERE plate = ?', { plate }, function()
+            GiveRadioItem(src)
+            TriggerClientEvent('cs:carplay:radioInstalled', src, plate, false)
+        end)
     end
 end)
 
@@ -424,21 +416,27 @@ RegisterNetEvent('cs:carplay:checkInstall', function(plate)
         TriggerClientEvent('cs:carplay:installStatus', src, true)
         return
     end
-    if not plate then
-        TriggerClientEvent('cs:carplay:installStatus', src, false)
-        return
-    end
-    plate = string.upper(string.gsub(plate, '%s+', ''))
-    MySQL.query(
-        'SELECT plate FROM cs_carplay_radio WHERE plate = ? LIMIT 1',
-        { plate },
-        function(result)
-            TriggerClientEvent('cs:carplay:installStatus', src, result ~= nil and result[1] ~= nil)
-        end
-    )
+    plate = string.upper(string.gsub(tostring(plate), '%s+', ''))
+    MySQL.query('SELECT plate FROM cs_carplay_radio WHERE plate = ? LIMIT 1', { plate }, function(result)
+        TriggerClientEvent('cs:carplay:installStatus', src, result ~= nil and result[1] ~= nil)
+    end)
 end)
 
--- ── Item-based open (ESX / QB) ─────────────────────────────
+-- ── Nearby music sync ────────────────────────────────────────
+
+RegisterNetEvent('cs:carplay:syncMusicServer', function(data)
+    local src = source
+    if CodeStudio.Music_Outside_Veh then
+        TriggerClientEvent('cs:carplay:nearbyMusicStart', -1, src, data)
+    end
+end)
+
+RegisterNetEvent('cs:carplay:stopSyncMusicServer', function()
+    local src = source
+    TriggerClientEvent('cs:carplay:nearbyMusicStop', -1, src)
+end)
+
+-- ── Item-based open ──────────────────────────────────────────
 
 if CodeStudio.Main.UseWithItem.Enable and CodeStudio.ServerType ~= false then
     if CodeStudio.ServerType == 'ESX' then
@@ -451,18 +449,3 @@ if CodeStudio.Main.UseWithItem.Enable and CodeStudio.ServerType ~= false then
         end)
     end
 end
-
--- ── Sync music to nearby players (outside-vehicle audio) ──
-
-RegisterNetEvent('cs:carplay:syncMusic', function(data)
-    local src = source
-
-    -- Broadcast to all other players so they can hear the music
-    -- from outside the vehicle (handled client-side via xSound distance check)
-    TriggerClientEvent('cs:carplay:nearbyMusic', -1, src, data)
-end)
-
-RegisterNetEvent('cs:carplay:stopSyncMusic', function()
-    local src = source
-    TriggerClientEvent('cs:carplay:stopNearbyMusic', -1, src)
-end)
