@@ -503,7 +503,6 @@ RegisterNUICallback('musicPlay', function(data, cb)
     if CodeStudio.Music_Outside_Veh then
         exports.xsound:PlayUrlPos('cs_carplay_music', data.url, musicVolume / 100, pos, true)
         exports.xsound:Distance('cs_carplay_music', CodeStudio.Outside_Music_Distance)
-        if veh ~= 0 then exports.xsound:attachSound('cs_carplay_music', veh) end
     else
         exports.xsound:PlayUrl('cs_carplay_music', data.url, musicVolume / 100, true)
     end
@@ -619,10 +618,23 @@ RegisterNUICallback('carAction', function(data, cb)
     end
 end)
 
--- /carControl  ← {type}
+-- /carControl  ← no body = state query; {type=...} = toggle action
 RegisterNUICallback('carControl', function(data, cb)
     local veh = GetVeh()
     if veh == 0 then cb({ status = 'error' }); return end
+
+    -- Called with no body to fetch initial state for the control panel UI
+    if not data or not data.type then
+        local _, lights, _ = GetVehicleLightsState(veh)
+        cb({
+            vEngine  = GetIsVehicleEngineRunning(veh),
+            vLight   = lights ~= 0,
+            vHazard  = hazardActive,
+            vDoors   = GetVehicleDoorAngleRatio(veh, 0) > 0.0,
+            vMusicRGB = rgbActive,
+        })
+        return
+    end
     local t = data.type
 
     if t == 'engine' then
@@ -683,8 +695,8 @@ RegisterNUICallback('carCamera', function(data, cb)
             cb({ status = 'error', msg = 'no_front_cam' }); return
         end
         if frontCam then DestroyCam(frontCam, false) end
-        frontCam = CreateCamWithParams('DEFAULT_SCRIPTED_CAMERA', 0,0,0, -10,0, GetEntityHeading(veh), 65, false, 0)
-        AttachCamToEntity(frontCam, veh, 0.0, 2.2, 0.5, true)
+        frontCam = CreateCamWithParams('DEFAULT_SCRIPTED_CAMERA', 0,0,0, -5,0, GetEntityHeading(veh), 90, false, 0)
+        AttachCamToEntity(frontCam, veh, 0.0, 1.8, 0.6, true)
         SetCamActive(frontCam, true)
         RenderScriptCams(true, false, 0, true, true)
         cb({ status = 'ok' })
@@ -696,8 +708,8 @@ RegisterNUICallback('carCamera', function(data, cb)
             cb({ status = 'error', msg = 'no_back_cam' }); return
         end
         if backCam then DestroyCam(backCam, false) end
-        backCam = CreateCamWithParams('DEFAULT_SCRIPTED_CAMERA', 0,0,0, -15,0, GetEntityHeading(veh)+180, 65, false, 0)
-        AttachCamToEntity(backCam, veh, 0.0, -2.2, 0.5, true)
+        backCam = CreateCamWithParams('DEFAULT_SCRIPTED_CAMERA', 0,0,0, -8,0, GetEntityHeading(veh)+180, 100, false, 0)
+        AttachCamToEntity(backCam, veh, 0.0, -2.0, 0.5, true)
         SetCamActive(backCam, true)
         RenderScriptCams(true, false, 0, true, true)
         cb({ status = 'ok' })
