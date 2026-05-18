@@ -289,11 +289,12 @@ local function OpenUI()
     StartParkingSensor()
 end
 
-local function CloseUI()
+-- RawCloseUI: cleans up Lua state only, does NOT message the JS
+-- (used by /closeUI NUI callback to avoid a send↔receive loop)
+local function RawCloseUI()
     isUIOpen       = false
     currentVehicle = 0
     SetNuiFocus(false, false)
-    NUI('closeUI', {})
     if autoPilotActive then StopAutoPilot() end
     if hazardActive then
         local veh = GetVeh()
@@ -305,12 +306,20 @@ local function CloseUI()
     if backCam   then DestroyCam(backCam,  false); backCam  = nil; RenderScriptCams(false,false,0,true,true) end
 end
 
+-- CloseUI: tells JS to hide itself, then cleans up Lua state
+-- (used when close is initiated from the Lua side)
+local function CloseUI()
+    NUI('closeUI', {})
+    RawCloseUI()
+end
+
 -- ── Events: open / close ─────────────────────────────────────
 
+-- Single handler for both local (TriggerEvent) and network (TriggerClientEvent) events.
+-- Two handlers for the same event would fire twice on each trigger, causing
+-- OpenUI() to run immediately followed by CloseUI().
+RegisterNetEvent('cs:carPlay:openUI')
 AddEventHandler('cs:carPlay:openUI', function()
-    if isUIOpen then CloseUI() else OpenUI() end
-end)
-RegisterNetEvent('cs:carPlay:openUI', function()
     if isUIOpen then CloseUI() else OpenUI() end
 end)
 
@@ -767,9 +776,9 @@ RegisterNUICallback('installRadio', function(data, cb)
     cb({ status = 'ok' })
 end)
 
--- /closeUI
+-- /closeUI  (JS-initiated close — use RawCloseUI to avoid send↔receive loop)
 RegisterNUICallback('closeUI', function(data, cb)
-    CloseUI()
+    RawCloseUI()
     cb({ status = 'ok' })
 end)
 
