@@ -281,7 +281,7 @@ local function OpenUI()
 
     if CodeStudio.Disable_GTA_Radio then
         SetVehicleRadioEnabled(veh, false)
-        SetVehicleRadioStation(veh, 'OFF')
+        SetVehRadioStation(veh, 'OFF')
     end
 
     SetNuiFocus(true, true)
@@ -336,7 +336,7 @@ RegisterNetEvent('cs:carplay:installStatus', function(installed)
 
     if CodeStudio.Disable_GTA_Radio then
         SetVehicleRadioEnabled(veh, false)
-        SetVehicleRadioStation(veh, 'OFF')
+        SetVehRadioStation(veh, 'OFF')
     end
 
     SetNuiFocus(true, true)
@@ -429,7 +429,7 @@ CreateThread(function()
             local veh = GetVeh()
             if veh ~= 0 then
                 SetVehicleRadioEnabled(veh, false)
-                SetVehicleRadioStation(veh, 'OFF')
+                SetVehRadioStation(veh, 'OFF')
             end
         end
     end
@@ -650,12 +650,15 @@ RegisterNUICallback('carControl', function(data, cb)
     end
 end)
 
--- /carCamera  ← {type: 'front'|'back'|'exit'}
+-- /carCamera  ← JS sends JSON.stringify("front"|"back"|"exit") or no body
 RegisterNUICallback('carCamera', function(data, cb)
     local ped = PlayerPedId()
     local veh = GetVehiclePedIsIn(ped, false)
 
-    if data.type == 'exit' then
+    -- data arrives as a plain string (or nil when $.post sends no body)
+    local camType = (type(data) == 'string' and data) or (type(data) == 'table' and data.type) or 'exit'
+
+    if camType == 'exit' then
         if frontCam then DestroyCam(frontCam, false); frontCam = nil end
         if backCam  then DestroyCam(backCam,  false); backCam  = nil end
         RenderScriptCams(false, false, 0, true, true)
@@ -664,7 +667,7 @@ RegisterNUICallback('carCamera', function(data, cb)
 
     if veh == 0 then cb({ status = 'error', msg = 'not_in_vehicle' }); return end
 
-    if data.type == 'front' then
+    if camType == 'front' then
         local bi = GetEntityBoneIndexByName(veh, 'bonnet')
         if bi == -1 then
             Notification(CodeStudio.Language.no_camera_front, 'error')
@@ -677,7 +680,7 @@ RegisterNUICallback('carCamera', function(data, cb)
         RenderScriptCams(true, false, 0, true, true)
         cb({ status = 'ok' })
 
-    elseif data.type == 'back' then
+    elseif camType == 'back' then
         local bi = GetEntityBoneIndexByName(veh, 'boot')
         if bi == -1 then
             Notification(CodeStudio.Language.no_camera_back, 'error')
