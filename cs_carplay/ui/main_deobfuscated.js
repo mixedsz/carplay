@@ -1954,8 +1954,8 @@ function updateCarControl(_0xc5bfb6) {
         },
         kqKfX: "/carAction",
       };
-      var _0x5f32a2 = $(this).attr("class").split(" ");
-      var _0x6f094d = _0x5f32a2[1].match(/\d+/)[0];
+      ($(this).attr("class").split(" "),
+        (_0x6f094d = _0x5f32a2[1].match(/\d+/)[0]));
       $.post(
         `https://${GetParentResourceName()}/carAction`,
         JSON.stringify({ type: "window", window: _0x6f094d }),
@@ -1980,8 +1980,8 @@ function updateCarControl(_0xc5bfb6) {
       cZFxh: "/carAction",
       oQHbb: "door",
     };
-    var _0x5b4e7b = $(this).attr("class").split(" ");
-    var _0x4a3b9f = _0x5b4e7b[1].match(/\d+/)[0];
+    ($(this).attr("class").split(" "),
+      (_0x4a3b9f = _0x5b4e7b[1].match(/\d+/)[0]));
     $.post(
       "https://" + GetParentResourceName() + "/carAction",
       JSON.stringify({ type: "door", door: _0x4a3b9f }),
